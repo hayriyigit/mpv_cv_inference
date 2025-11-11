@@ -4,14 +4,13 @@ import argparse
 import asyncio
 import hashlib
 import signal
-from collections import OrderedDict, deque
+from collections import deque
 from typing import Any, Deque, Dict, Iterable, Optional, Tuple
 
 import zmq
 import zmq.asyncio
 from loguru import logger
 from PIL import Image, ImageDraw
-import numpy as np
 
 from src.lib.mpv import MPV
 from src.shared.models import (
@@ -21,15 +20,6 @@ from src.shared.models import (
     ServerStatus,
     Topic,
 )
-from src.shared.sync import (
-    FrameFingerprint,
-    FrameSignature,
-    FrameSyncPacket,
-    FrameSynchronizer,
-    SyncedPair,
-    capture_timestamp,
-)
-
 
 
 class InferenceCache:
@@ -38,155 +28,56 @@ class InferenceCache:
     def __init__(self, max_items: int = 1024, tolerance: float = 0.05) -> None:
         self.max_items = max_items
         self.tolerance = tolerance
-        self._entries: Dict[str, InferenceResult] = {}
-        self._by_hash: Dict[str, OrderedDict[str, None]] = {}
-        self._by_index: Dict[int, str] = {}
+        self._by_hash: Dict[str, InferenceResult] = {}
         self._timeline: Deque[Tuple[float, str]] = deque()
 
     def add(self, result: InferenceResult) -> None:
-        key = self._make_key(result)
-        self._entries[key] = result
-        self._timeline.append((result.sync.timestamp, key))
-
-        hash_bucket = self._by_hash.setdefault(result.sync.frame_hash, OrderedDict())
-        if key in hash_bucket:
-            hash_bucket.move_to_end(key)
+        key = result.sync.frame_hash
+        if key in self._by_hash:
+            # Update timestamp if the same hash reappears (e.g. seeking backwards)
+            self._timeline.append((result.sync.timestamp, key))
+            self._by_hash[key] = result
         else:
-            hash_bucket[key] = None
-
-        if result.sync.frame_index is not None:
-            old_key = self._by_index.get(result.sync.frame_index)
-            if old_key is not None and old_key != key:
-                self._remove_entry(old_key)
-            self._by_index[result.sync.frame_index] = key
-
+            self._by_hash[key] = result
+            self._timeline.append((result.sync.timestamp, key))
         self._evict_if_needed()
+
+    def _evict_if_needed(self) -> None:
+        while len(self._timeline) > self.max_items:
+            ts, key = self._timeline.popleft()
+            stored = self._by_hash.get(key)
+            if stored is not None and stored.sync.timestamp == ts:
+                self._by_hash.pop(key, None)
 
     def lookup(self, timestamp: float) -> Optional[InferenceResult]:
         cutoff = timestamp - self.tolerance
-        best: Optional[InferenceResult] = None
-        best_score: Tuple[float, int, float] = (float("inf"), 2, float("inf"))
+        nearest: Optional[Tuple[float, InferenceResult]] = None
         for ts, key in reversed(self._timeline):
             if ts < cutoff:
                 break
-            result = self._entries.get(key)
+            result = self._by_hash.get(key)
             if result is None:
                 continue
-            offset = result.sync.timestamp - timestamp
-            delta = abs(offset)
-            if delta <= self.tolerance:
-                score = (delta, 0 if offset <= 0 else 1, abs(offset))
-                if score < best_score:
-                    best = result
-                    best_score = score
-                    if delta <= 1e-6 and score[1] == 0:
-                        break
-        return best
+            if abs(result.sync.timestamp - timestamp) <= self.tolerance:
+                if nearest is None or abs(result.sync.timestamp - timestamp) < abs(nearest[0] - timestamp):
+                    nearest = (result.sync.timestamp, result)
+        return nearest[1] if nearest else None
 
     def latest(self) -> Optional[InferenceResult]:
         for _, key in reversed(self._timeline):
-            result = self._entries.get(key)
-            if result is not None:
+            result = self._by_hash.get(key)
+            if result:
                 return result
         return None
 
-    def get_by_hash(
-        self,
-        frame_hash: str,
-        *,
-        timestamp: Optional[float] = None,
-        frame_index_hint: Optional[int] = None,
-    ) -> Optional[InferenceResult]:
-        bucket = self._by_hash.get(frame_hash)
-        if not bucket:
-            return None
-
-        if frame_index_hint is not None:
-            for key in reversed(bucket):
-                candidate = self._entries.get(key)
-                if candidate is not None and candidate.sync.frame_index == frame_index_hint:
-                    return candidate
-
-        if timestamp is not None:
-            best: Optional[InferenceResult] = None
-            best_score: Tuple[float, int, float] = (float("inf"), 2, float("inf"))
-            for key in reversed(bucket):
-                candidate = self._entries.get(key)
-                if candidate is None:
-                    continue
-                offset = candidate.sync.timestamp - timestamp
-                delta = abs(offset)
-                if delta <= self.tolerance:
-                    score = (delta, 0 if offset <= 0 else 1, abs(offset))
-                else:
-                    score = (delta, 1, abs(offset))
-                if score < best_score:
-                    best = candidate
-                    best_score = score
-                    if delta <= 1e-6 and score[1] == 0:
-                        break
-            if best is not None:
-                return best
-
-        for key in reversed(bucket):
-            candidate = self._entries.get(key)
-            if candidate is not None:
-                return candidate
-        return None
-
-    def get_by_frame_index(self, frame_index: int) -> Optional[InferenceResult]:
-        key = self._by_index.get(frame_index)
-        if not key:
-            return None
-        return self._entries.get(key)
-
-    def _evict_if_needed(self) -> None:
-        while len(self._entries) > self.max_items and self._timeline:
-            _, key = self._timeline.popleft()
-            entry = self._entries.get(key)
-            if entry is None:
-                continue
-            self._remove_entry(key)
-
-    def _remove_entry(self, key: str) -> None:
-        result = self._entries.pop(key, None)
-        if result is None:
-            return
-        hash_bucket = self._by_hash.get(result.sync.frame_hash)
-        if hash_bucket is not None:
-            hash_bucket.pop(key, None)
-            if not hash_bucket:
-                self._by_hash.pop(result.sync.frame_hash, None)
-        if result.sync.frame_index is not None:
-            existing = self._by_index.get(result.sync.frame_index)
-            if existing == key:
-                self._by_index.pop(result.sync.frame_index, None)
-
-    def _make_key(self, result: InferenceResult) -> str:
-        sync = result.sync
-        capture_component = (
-            f"{sync.capture_time:.6f}" if sync.capture_time is not None else "*"
-        )
-        index_component = (
-            str(sync.frame_index) if sync.frame_index is not None else "*"
-        )
-        return "|".join(
-            [
-                sync.frame_hash,
-                f"{sync.timestamp:.6f}",
-                index_component,
-                capture_component,
-            ]
-        )
+    def get_by_hash(self, frame_hash: str) -> Optional[InferenceResult]:
+        return self._by_hash.get(frame_hash)
 
     def __len__(self) -> int:  # pragma: no cover - trivial
-        return len(self._entries)
+        return len(self._by_hash)
 
 
 class InferenceClient:
-    _MAX_INDEX_SKEW_FOR_TRUST = 6
-    _MAX_CAPTURE_REWIND_S = 0.5
-
     def __init__(
         self,
         video_uri: str,
@@ -210,18 +101,7 @@ class InferenceClient:
         self._last_time_pos: Optional[float] = None
         self._last_hash_rendered: Optional[str] = None
         self._last_hash_verified: Optional[str] = None
-        self._last_frame_index_rendered: Optional[int] = None
-        self._last_capture_time_rendered: Optional[float] = None
         self._render_lock = asyncio.Lock()
-        sync_tolerance = max(0.015, min(0.05, tolerance))
-        self._syncer = FrameSynchronizer(
-            reference_stream="local",
-            tolerance=sync_tolerance,
-            buffer_duration=max(0.5, tolerance * 6),
-            drift_alpha=0.05,
-        )
-        self._local_frame_counter = 0
-        self._last_signature: Optional[FrameSignature] = None
 
     async def start(self) -> None:
         self.sub_socket = self.context.socket(zmq.SUB)
@@ -308,24 +188,6 @@ class InferenceClient:
             if topic == Topic.INFERENCE.value:
                 result = InferenceResult.model_validate_json(payload)
                 self.cache.add(result)
-                fingerprint = None
-                extra = result.extra if isinstance(result.extra, dict) else {}
-                if isinstance(extra, dict):
-                    fingerprint = FrameFingerprint.from_dict(extra.get("fingerprint"))
-                server_signature = FrameSignature(
-                    frame_hash=result.sync.frame_hash,
-                    fingerprint=fingerprint,
-                )
-                server_packet = FrameSyncPacket(
-                    stream_id="server",
-                    pts=result.sync.timestamp,
-                    monotonic_ts=result.sync.capture_time or result.server_time,
-                    frame_index=result.sync.frame_index,
-                    signature=server_signature,
-                    payload=result,
-                )
-                for pair in self._syncer.add_packet(server_packet):
-                    asyncio.create_task(self._apply_synced_pair(pair))
                 if (
                     self._last_time_pos is not None
                     and abs(self._last_time_pos - result.sync.timestamp) <= self.cache.tolerance
@@ -394,61 +256,13 @@ class InferenceClient:
             return
         async with self._render_lock:
             self._last_time_pos = time_pos
-            signature = await asyncio.to_thread(self._capture_frame_signature)
-            if signature is not None:
-                self._last_signature = signature
-            frame_hash = signature.frame_hash if signature else None
-
-            local_pairs_processed = False
-            if signature is not None:
-                self._local_frame_counter += 1
-                local_payload = {"signature": signature, "time_pos": time_pos}
-                local_packet = FrameSyncPacket(
-                    stream_id="local",
-                    pts=time_pos,
-                    monotonic_ts=capture_timestamp(),
-                    frame_index=self._local_frame_counter,
-                    signature=signature,
-                    payload=local_payload,
-                )
-                for pair in self._syncer.add_packet(local_packet):
-                    try:
-                        local_pkt, server_pkt = pair.ordered("local")
-                    except ValueError:
-                        continue
-                    result_payload = server_pkt.payload
-                    if not isinstance(result_payload, InferenceResult):
-                        continue
-                    payload = local_pkt.payload or {}
-                    local_sig = payload.get("signature")
-                    local_time = payload.get("time_pos")
-                    if local_sig is None or local_time is None:
-                        continue
-                    await self._render_result_for_frame(result_payload, local_sig, local_time)
-                    local_pairs_processed = True
-                    break
-                if local_pairs_processed:
-                    return
-
+            frame_hash = await asyncio.to_thread(self._capture_frame_hash)
             if frame_hash and frame_hash == self._last_hash_rendered:
                 return
 
-            frame_index_hint = self._last_frame_index_rendered
-            result: Optional[InferenceResult] = None
+            result = None
             if frame_hash:
-                result = self.cache.get_by_hash(
-                    frame_hash,
-                    timestamp=time_pos,
-                    frame_index_hint=frame_index_hint,
-                )
-
-            if result is None and frame_index_hint is not None:
-                candidate = self.cache.get_by_frame_index(frame_index_hint)
-                if (
-                    candidate is not None
-                    and abs(candidate.sync.timestamp - time_pos) <= self.cache.tolerance
-                ):
-                    result = candidate
+                result = self.cache.get_by_hash(frame_hash)
 
             if result is None:
                 result = self.cache.lookup(time_pos)
@@ -456,75 +270,43 @@ class InferenceClient:
             if result is None:
                 return
 
-            await self._render_result_for_frame(result, signature, time_pos)
+            expected_hash = result.sync.frame_hash
+            if frame_hash and frame_hash != expected_hash:
+                delta_ts = time_pos - result.sync.timestamp
+                if abs(delta_ts) <= self.cache.tolerance * 2:
+                    logger.warning(
+                        "Frame hash mismatch: client={} server={} (Δt={:.3f}s) – using server hash",
+                        frame_hash,
+                        expected_hash,
+                        delta_ts,
+                    )
+                    frame_hash = expected_hash
+                else:
+                    logger.warning(
+                        "Frame hash mismatch outside tolerance: client={} server={} (Δt={:.3f}s)",
+                        frame_hash,
+                        expected_hash,
+                        delta_ts,
+                    )
+                    return
 
-    async def _apply_synced_pair(self, pair: SyncedPair) -> None:
-        async with self._render_lock:
-            try:
-                local_packet, server_packet = pair.ordered("local")
-            except ValueError:
-                return
-            result = server_packet.payload
-            payload = local_packet.payload or {}
-            signature = payload.get("signature")
-            time_pos = payload.get("time_pos")
-            if not isinstance(result, InferenceResult) or signature is None or time_pos is None:
-                return
-            await self._render_result_for_frame(result, signature, time_pos)
+            if frame_hash is None:
+                frame_hash = expected_hash
 
-    async def _render_result_for_frame(
-        self,
-        result: InferenceResult,
-        local_signature: Optional[FrameSignature],
-        time_pos: float,
-    ) -> None:
-        expected_hash = result.sync.frame_hash
-        server_index = result.sync.frame_index
-        extras = result.extra if isinstance(result.extra, dict) else {}
-        if server_index is None and isinstance(extras, dict):
-            maybe_index = extras.get("frame_index")
-            if isinstance(maybe_index, int):
-                server_index = maybe_index
-
-        server_fingerprint = FrameFingerprint.from_dict(extras.get("fingerprint")) if isinstance(extras, dict) else None
-        server_signature = FrameSignature(frame_hash=expected_hash, fingerprint=server_fingerprint)
-
-        if local_signature is not None and not local_signature.matches(server_signature):
-            delta_ts = time_pos - result.sync.timestamp
-            logger.warning(
-                "Frame verification failed: local_hash={} server_hash={} Δt={:.3f}s – clearing overlay",
-                local_signature.frame_hash,
-                expected_hash,
-                delta_ts,
+            frame_shape = result.extra.get("frame_shape") if isinstance(result.extra, dict) else None
+            target_size, pos, scale = self._compute_overlay_geometry(frame_shape)
+            overlay_image = await asyncio.to_thread(
+                self._generate_overlay_image,
+                result,
+                target_size,
+                scale,
             )
-            await self._clear_overlay()
-            return
+            if overlay_image is None:
+                return
 
-        frame_shape = extras.get("frame_shape") if isinstance(extras, dict) else None
-        target_size, pos, scale = self._compute_overlay_geometry(frame_shape)
-        overlay_image = await asyncio.to_thread(
-            self._generate_overlay_image,
-            result,
-            target_size,
-            scale,
-        )
-        if overlay_image is None:
-            await self._clear_overlay()
-            return
-
-        await self._update_overlay(overlay_image, pos)
-        if local_signature is not None:
-            self._last_hash_verified = local_signature.frame_hash
-        else:
-            self._last_hash_verified = expected_hash
-        self._last_hash_rendered = expected_hash
-        self._last_frame_index_rendered = server_index
-        if result.sync.capture_time is not None:
-            self._last_capture_time_rendered = result.sync.capture_time
-        elif isinstance(extras, dict):
-            maybe_capture = extras.get("capture_time")
-            if isinstance(maybe_capture, (int, float)):
-                self._last_capture_time_rendered = float(maybe_capture)
+            await self._update_overlay(overlay_image, pos)
+            self._last_hash_verified = frame_hash
+            self._last_hash_rendered = expected_hash
 
     async def _clear_overlay(self) -> None:
         if self._overlay is None or self._mpv is None:
@@ -533,9 +315,6 @@ class InferenceClient:
         self._overlay = self._mpv.create_image_overlay()
         self._last_hash_rendered = None
         self._last_hash_verified = None
-        self._last_frame_index_rendered = None
-        self._last_capture_time_rendered = None
-        self._last_signature = None
 
     async def _update_overlay(self, img: Optional[Image.Image], pos: Tuple[int, int]) -> None:
         if self._overlay is None or self._mpv is None:
@@ -559,11 +338,9 @@ class InferenceClient:
         overlay = Image.new("RGBA", (target_width, target_height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         boxes = self._extract_overlay_boxes(result, scale, target_size)
-
         if not boxes:
             return None
 
-            
         for label, confidence, x1, y1, x2, y2 in boxes:
             draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0, 200), width=4)
             text = f"{label} {confidence:.2f}" if confidence is not None else label
@@ -675,7 +452,7 @@ class InferenceClient:
 
         return (target_w, target_h), offset, (scale_x, scale_y)
 
-    def _capture_raw_frame(self) -> Optional[Dict[str, Any]]:
+    def _capture_frame_hash(self) -> Optional[str]:
         if self._mpv is None:
             return None
         try:
@@ -685,52 +462,7 @@ class InferenceClient:
             return None
         if not data:
             return None
-        return data
-
-    @staticmethod
-    def _raw_to_numpy(data: Dict[str, Any]) -> np.ndarray:
-        width = int(data["w"])
-        height = int(data["h"])
-        stride = int(data["stride"])
-        fmt = str(data["format"]).lower()
-        buffer = np.frombuffer(bytes(data["data"]), dtype=np.uint8)
-        bytes_per_pixel = 4
-        row_pixels = stride // bytes_per_pixel
-        try:
-            array = buffer.reshape((height, row_pixels, bytes_per_pixel))
-        except ValueError as exc:  # pragma: no cover - indicates corrupted buffer
-            raise ValueError(
-                f"Failed to reshape frame buffer (len={buffer.size}, height={height}, stride={stride})"
-            ) from exc
-        array = array[:, :width, :].copy()
-        if fmt in {"bgra", "bgr0"}:
-            array = array[:, :, [2, 1, 0, 3]]
-            if fmt == "bgr0":
-                array[:, :, 3] = 255
-        elif fmt == "rgb0":
-            array[:, :, 3] = 255
-        elif fmt != "rgba":
-            raise ValueError(f"Unsupported screenshot-raw format: {fmt}")
-        return array
-
-    def _capture_frame_signature(self) -> Optional[FrameSignature]:
-        raw = self._capture_raw_frame()
-        if raw is None:
-            return None
-        raw_bytes = bytes(raw["data"])
-        raw_copy = dict(raw)
-        raw_copy["data"] = raw_bytes
-        try:
-            frame = self._raw_to_numpy(raw_copy)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to decode client frame: {}", exc)
-            return None
-        try:
-            frame_hash = hashlib.blake2b(raw_bytes, digest_size=16).hexdigest()
-            return FrameSignature.from_numpy(frame, frame_hash=frame_hash)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to compute frame signature: {}", exc)
-            return None
+        return hashlib.blake2b(bytes(data['data']), digest_size=16).hexdigest()
 
     async def _send_control(self, command: ModelControlCommand) -> None:
         if not self.ctrl_socket:
@@ -794,7 +526,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parse_args(argv)
-    # args.video = "udp://239.0.0.1:1234"
     client = InferenceClient(
         video_uri=args.video,
         sub_endpoint=args.sub,

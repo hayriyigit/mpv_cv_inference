@@ -12,7 +12,6 @@ dependencies = [
 	"loguru>=0.7",
 	"typing-extensions>=4.9",
 	"pytest>=9.0.0",
-	"ultralytics>=8.3.227",
 ]
 
 [project.optional-dependencies]

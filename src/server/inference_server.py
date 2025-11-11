@@ -28,9 +28,6 @@ from src.shared.models import (
     ServerStatus,
     Topic,
 )
-from src.shared.sync import FrameSignature
-
-from ultralytics import YOLO
 
 
 @dataclass
@@ -119,27 +116,30 @@ class BrightnessHotspotModel(BaseModelRunner):
         super().__init__()
         self.sensitivity = sensitivity
         self.min_pixels = min_pixels
-        self.model = YOLO("yolov8n.pt")  # Placeholder for actual model loading
 
     def current_parameters(self) -> Dict[str, Any]:
         return {"sensitivity": self.sensitivity, "min_pixels": self.min_pixels}
 
     def infer(self, frame_rgba: np.ndarray) -> List[ModelDetection]:
-        detections = self.model(frame_rgba[:, :, :3])  # Assuming model expects RGB input
-        results = []
-        for det in detections[0]:
-            if det.boxes.shape[0] > 0:
-                bbox = det.boxes[0].xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = bbox
-                width = x2 - x1
-                height = y2 - y1
-                bbox_obj = BoundingBox(x=int(x1), y=int(y1), width=int(width), height=int(height))
-                confidence = float(det.boxes[0].conf.cpu().numpy())
-                extra = {"class_id": int(det.boxes[0].cls.cpu().numpy())}
-                results.append(ModelDetection(bbox=bbox_obj, confidence=confidence, extra=extra))
+        grayscale = np.mean(frame_rgba[:, :, :3], axis=2)
+        threshold = np.clip(self.sensitivity * 255.0, 0, 255)
+        mask = grayscale >= threshold
+        if mask.sum() < self.min_pixels:
+            return []
 
-        print(f"[{self.name}] Detected {len(results)} objects.")
-        return results
+        ys, xs = np.where(mask)
+        x_min, x_max = int(xs.min()), int(xs.max())
+        y_min, y_max = int(ys.min()), int(ys.max())
+        coverage = mask.mean()
+        bbox = BoundingBox(
+            x=x_min,
+            y=y_min,
+            width=max(1, x_max - x_min + 1),
+            height=max(1, y_max - y_min + 1),
+        )
+        confidence = float(np.clip(coverage / 0.5, 0.0, 1.0))
+        extra = {"mean_brightness": float(grayscale.mean()), "coverage": float(coverage)}
+        return [ModelDetection(bbox=bbox, confidence=confidence, extra=extra)]
 
     def update_parameters(self, parameters: Dict[str, Any]) -> None:
         if "sensitivity" in parameters:
@@ -334,7 +334,6 @@ class InferenceServer:
             frame_np = sample.to_numpy()
             frame_hash = sample.digest()
             timestamp = sample.timestamp
-            signature = FrameSignature.from_numpy(frame_np, frame_hash=frame_hash)
             sync = FrameSyncMetadata(
                 video_uri=self.video_uri,
                 timestamp=timestamp,
@@ -388,7 +387,6 @@ class InferenceServer:
                     extra={
                         "frame_index": sample.frame_index,
                         "frame_shape": [sample.height, sample.width],
-                            "fingerprint": signature.fingerprint.to_dict() if signature.fingerprint else None,
                         "humannet_results": humannet_boxes,
                         "othermodel_results": [],
                     },

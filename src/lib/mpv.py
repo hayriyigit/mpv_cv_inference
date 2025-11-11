@@ -33,7 +33,6 @@ from concurrent.futures import Future, InvalidStateError
 import collections
 import re
 import traceback
-from PIL import Image
 
 if os.name == 'nt':
     # Note: mpv-2.dll with API version 2 corresponds to mpv v0.35.0. Most things should work with the fallback, too.
@@ -784,6 +783,7 @@ class ImageOverlay:
             self.update(img)
 
     def update(self, img=None, pos=None):
+        from PIL import Image
         if img is not None:
             self.img = img
         img = self.img

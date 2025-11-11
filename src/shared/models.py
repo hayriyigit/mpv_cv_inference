@@ -39,11 +39,6 @@ class FrameSyncMetadata(BaseModel):
         ge=0,
         description="Optional monotonically increasing frame counter maintained by the server",
     )
-    capture_time: Optional[float] = Field(
-        default=None,
-        ge=0.0,
-        description="Server monotonic timestamp recorded when the frame pixels were captured.",
-    )
 
 
 class InferenceMetadata(BaseModel):
